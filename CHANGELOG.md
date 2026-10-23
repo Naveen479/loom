@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Tool-set change note
+- **The model is told once when its tool set changes within a turn.** When the advertised tools differ between two provider calls of one turn (progressive disclosure activates a tool, a skill fold deactivates one, a circuit breaker excludes one), the next request carries a transient `<system-reminder>` such as `Tools added: a, b. Tools removed: c.`. Changes between turns are not announced. The note is never stored in session history or replayed, and the first provider call of a turn emits none.
+
 #### HITL park: tools other than `contact_human` can park as questions
 - **`shuttle.ParkableQuestion`** lets a tool whose result is a human's answer park the turn as a `question` item, like `contact_human`. `ParkQuestion(ctx, input)` reports whether the call parks and the question text; `ParkAnswerResult(ctx, input, answer)` builds the tool result on an approved resume. With park enabled (`WithHITLPark`) `Execute` does not run for a parked call. The call's input is under `params` in the descriptor, subject to the usual `params_truncated` bound. `Execute` still runs when `ParkQuestion` returns `ok=false`, when the call ID is empty or duplicated in the batch, or when park is disabled. Resume uses the kind recorded on the park row rather than calling `ParkQuestion` again; a policy `Deny` is never lifted and a policy `Ask` yields only the question card. A rejected resume synthesizes `permission_denied`, an empty answer `MISSING_ANSWER`, and a nil `ParkAnswerResult` `internal_error`. See `docs/architecture/hitl-park-and-resume.md`.
 
