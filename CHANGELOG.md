@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Context-window warning when relief cannot reach its target
+- **The model is warned on each send where automatic compaction leaves the context over its release mark.** It rides the same transient send path as the turn and tool reminders, so it is never stored in history (`buildContextReminder`, `conversation_helpers.go`). The `soft_reminder.added` span event gains `has_context_reminder`.
+
 #### HITL park: tools other than `contact_human` can park as questions
 - **`shuttle.ParkableQuestion`** lets a tool whose result is a human's answer park the turn as a `question` item, like `contact_human`. `ParkQuestion(ctx, input)` reports whether the call parks and the question text; `ParkAnswerResult(ctx, input, answer)` builds the tool result on an approved resume. With park enabled (`WithHITLPark`) `Execute` does not run for a parked call. The call's input is under `params` in the descriptor, subject to the usual `params_truncated` bound. `Execute` still runs when `ParkQuestion` returns `ok=false`, when the call ID is empty or duplicated in the batch, or when park is disabled. Resume uses the kind recorded on the park row rather than calling `ParkQuestion` again; a policy `Deny` is never lifted and a policy `Ask` yields only the question card. A rejected resume synthesizes `permission_denied`, an empty answer `MISSING_ANSWER`, and a nil `ParkAnswerResult` `internal_error`. See `docs/architecture/hitl-park-and-resume.md`.
 

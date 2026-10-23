@@ -16,6 +16,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -270,6 +271,91 @@ func TestBuildTurnReminder(t *testing.T) {
 			}
 		})
 	}
+}
+
+const reliefWarningText = "Automatic context compaction could not free enough room"
+
+// reliefSeamAgent returns an agent whose session already holds sm, so the Chat
+// turn starts from a known relief state (the session keeps an existing
+// SegmentedMem, see ensureSessionMemory).
+func reliefSeamAgent(t *testing.T, llm *capturingLLM, sessionID string, sm *SegmentedMemory) *Agent {
+	t.Helper()
+	cfg := DefaultConfig()
+	cfg.PatternConfig = DefaultPatternConfig()
+	cfg.PatternConfig.UseLLMClassifier = false
+	ag := NewAgent(&mockBackend{}, llm, WithConfig(cfg))
+	session := ag.memory.GetOrCreateSession(context.Background(), sessionID)
+	session.SegmentedMem = sm
+	return ag
+}
+
+// Relief evicts the prior turn's batch and gets the context under target: no
+// warning in the request, and the shed is real (rows render as evicted).
+func TestContextReminder_SilentWhenShedReachesTarget(t *testing.T) {
+	llm := &capturingLLM{response: "done"}
+	sm := parallelBatchMemory(t, 12000, 1000, 40, "run_query")
+	ag := reliefSeamAgent(t, llm, "ctx_reminder_quiet", sm)
+
+	_, err := ag.Chat(context.Background(), "ctx_reminder_quiet", "hi")
+	require.NoError(t, err)
+
+	shedRows := 0
+	for i := 0; i < 40; i++ {
+		if toolRenders(sm)[fmt.Sprintf("c%d", i)] != denseResult(i) {
+			shedRows++
+		}
+	}
+	require.Greater(t, shedRows, 0, "relief must have shed rows for this case to mean anything")
+	for _, m := range llm.lastMessages() {
+		assert.NotContains(t, m.Content, reliefWarningText)
+	}
+}
+
+// The current turn's own user message (about 8000 tokens) sits between the
+// release mark (6600) and the start mark (9900). Relief evicts the batch, still
+// cannot reach target, and the warning must reach the request only, not history.
+func TestContextReminder_WarnsOnlyWhenReliefCannotReachTarget(t *testing.T) {
+	llm := &capturingLLM{response: "done"}
+	sm := parallelBatchMemory(t, 12000, 1000, 40, "run_query")
+	ag := reliefSeamAgent(t, llm, "ctx_reminder_warn", sm)
+
+	_, err := ag.Chat(context.Background(), "ctx_reminder_warn", strings.Repeat("lorem ipsum ", 4000))
+	require.NoError(t, err)
+
+	last := llm.lastMessages()
+	require.NotEmpty(t, last)
+	assert.Equal(t, "user", last[len(last)-1].Role)
+	assert.Contains(t, last[len(last)-1].Content, reliefWarningText)
+
+	session, ok := ag.GetSession("ctx_reminder_warn")
+	require.True(t, ok)
+	for _, m := range session.GetMessages() {
+		assert.NotContains(t, m.Content, reliefWarningText, "warning must not be persisted")
+	}
+}
+
+// Nothing is sheddable: a fresh session whose only content is one user message
+// of about 10.8k tokens, over the 9900 start mark. Relief runs, sheds nothing,
+// and returns estimate > target. The warning must still reach the request.
+func TestContextReminder_WarnsWhenStuckOverStartWithoutShed(t *testing.T) {
+	llm := &capturingLLM{response: "done"}
+	sm := NewSegmentedMemory("ROM", 12000, 1000)
+	ag := reliefSeamAgent(t, llm, "ctx_reminder_stuck", sm)
+
+	_, err := ag.Chat(context.Background(), "ctx_reminder_stuck", strings.Repeat("lorem ipsum ", 5300))
+	require.NoError(t, err)
+
+	last := llm.lastMessages()
+	require.NotEmpty(t, last)
+	assert.Equal(t, "user", last[len(last)-1].Role)
+	assert.Contains(t, last[len(last)-1].Content, reliefWarningText)
+}
+
+func TestBuildContextReminderPercentOfUsable(t *testing.T) {
+	// 7000 of 10000 usable tokens is 70%, whatever the reserved output is.
+	assert.Contains(t, buildContextReminder(7000, 10000), "~70% of the window")
+	// No usable window: no division by zero, and the warning still reads.
+	assert.Contains(t, buildContextReminder(5, 0), "~0% of the window")
 }
 
 func TestExtractErrorType(t *testing.T) {

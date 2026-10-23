@@ -2602,27 +2602,15 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// invalidate the ROM cache prefix at exactly the high-pressure moment)
 		// and never persisted, so it survives any relief recompile of messages.
 		softReminder := ""
+		toolReminder, turnReminder := "", ""
 		if session.SegmentedMem != nil {
 			// Check tool execution reminder
-			toolReminder := buildSoftReminder(toolExecutionCount, a.config.MaxToolExecutions)
+			toolReminder = buildSoftReminder(toolExecutionCount, a.config.MaxToolExecutions)
 			// Check turn count reminder
-			turnReminder := buildTurnReminder(turnCount, a.config.MaxTurns)
+			turnReminder = buildTurnReminder(turnCount, a.config.MaxTurns)
 
 			// Combine reminders if both are active
 			softReminder = toolReminder + turnReminder
-
-			if softReminder != "" {
-				span.AddEvent("soft_reminder.added", map[string]interface{}{
-					"tool_count":        toolExecutionCount,
-					"turn_count":        turnCount,
-					"max_tools":         a.config.MaxToolExecutions,
-					"max_turns":         a.config.MaxTurns,
-					"tool_threshold":    int(float64(a.config.MaxToolExecutions) * 0.75),
-					"turn_threshold":    int(float64(a.config.MaxTurns) * 0.75),
-					"has_tool_reminder": toolReminder != "",
-					"has_turn_reminder": turnReminder != "",
-				})
-			}
 		}
 
 		// Emit LLM generation progress
@@ -2660,8 +2648,10 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// loom's own estimate (§5.1) — a no-op under the start mark, otherwise it
 		// sheds to the release mark. On a shed, recompile messages and the
 		// advertised tool set so a fold-deactivated skill's tools do not linger.
+		contextReminder := ""
 		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
-			if shed, estimate, target := segMem.ReleasePressure(ctx, 0); shed {
+			shed, estimate, target := segMem.ReleasePressure(ctx, 0)
+			if shed {
 				zap.L().Info("relief: shed before send",
 					zap.String("session_id", session.ID),
 					zap.Int("estimate_tokens", estimate),
@@ -2670,6 +2660,14 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				tools = a.advertisedTools(session)
 				tools = recovery.activeTools(tools)
 				segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
+			}
+			// Relief left the estimate over its release mark, whether or not it
+			// shed (under the start mark it returns 0, 0 and this is false). The
+			// reminder is transient: softReminder is read at send time.
+			if estimate > target {
+				used, available, _ := segMem.GetTokenBudgetUsage()
+				contextReminder = buildContextReminder(estimate, used+available)
+				softReminder += contextReminder
 			}
 			// Relief has nothing left to shed and the turn's own stubs still
 			// hold the context over the start mark: every further send is a
@@ -2702,6 +2700,20 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 						"tool_results":    o.ToolResults,
 					})
 			}
+		}
+
+		if softReminder != "" {
+			span.AddEvent("soft_reminder.added", map[string]interface{}{
+				"tool_count":           toolExecutionCount,
+				"turn_count":           turnCount,
+				"max_tools":            a.config.MaxToolExecutions,
+				"max_turns":            a.config.MaxTurns,
+				"tool_threshold":       int(float64(a.config.MaxToolExecutions) * 0.75),
+				"turn_threshold":       int(float64(a.config.MaxTurns) * 0.75),
+				"has_tool_reminder":    toolReminder != "",
+				"has_turn_reminder":    turnReminder != "",
+				"has_context_reminder": contextReminder != "",
+			})
 		}
 
 		// withReminder appends the transient tail — the turn's soft reminder —
