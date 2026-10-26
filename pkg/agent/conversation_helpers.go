@@ -130,17 +130,18 @@ func buildTurnReminder(turnCount int, maxTurns int) string {
 	return ""
 }
 
-// buildContextReminder warns the model that automatic relief left the context
-// over its release mark. The caller gates it on estimate > target. Both figures
-// are tokens; the percent is of the usable window (MaxTokens - Reserved), the
-// base the relief marks use.
-func buildContextReminder(usedTokens, usableTokens int) string {
-	pct := 0
-	if usableTokens > 0 {
-		pct = usedTokens * 100 / usableTokens
+// buildContextReminder tells the model that automatic relief ran and left the
+// context over its release mark. The caller gates it on estimate > target. All
+// three figures are tokens; the percents are of the usable window (MaxTokens -
+// Reserved), the base the relief marks use, and the estimate's is capped at 100.
+func buildContextReminder(estimateTokens, targetTokens, usableTokens int) string {
+	if usableTokens <= 0 {
+		usableTokens = 1
 	}
-	return fmt.Sprintf("\n\n⛔ WARNING: Automatic context compaction could not free enough room (context still ~%d%% of the window). "+
-		"Summarise what you have and finish soon; avoid large tool outputs.", pct)
+	pct := min(estimateTokens*100/usableTokens, 100)
+	return fmt.Sprintf("\n\n🔔 NOTICE: Automatic context compaction ran and left the context at ~%d%% of the window (its target is %d%%). "+
+		"If it keeps growing, summarise what you have and finish soon; avoid large tool outputs.",
+		pct, targetTokens*100/usableTokens)
 }
 
 // keepaliveProgress sends periodic progress updates during long-running operations.

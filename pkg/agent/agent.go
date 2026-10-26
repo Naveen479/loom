@@ -2617,15 +2617,27 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// invalidate the ROM cache prefix at exactly the high-pressure moment)
 		// and never persisted, so it survives any relief recompile of messages.
 		softReminder := ""
-		toolReminder, turnReminder := "", ""
 		if session.SegmentedMem != nil {
 			// Check tool execution reminder
-			toolReminder = buildSoftReminder(toolExecutionCount, a.config.MaxToolExecutions)
+			toolReminder := buildSoftReminder(toolExecutionCount, a.config.MaxToolExecutions)
 			// Check turn count reminder
-			turnReminder = buildTurnReminder(turnCount, a.config.MaxTurns)
+			turnReminder := buildTurnReminder(turnCount, a.config.MaxTurns)
 
 			// Combine reminders if both are active
 			softReminder = toolReminder + turnReminder
+
+			if softReminder != "" {
+				span.AddEvent("soft_reminder.added", map[string]interface{}{
+					"tool_count":        toolExecutionCount,
+					"turn_count":        turnCount,
+					"max_tools":         a.config.MaxToolExecutions,
+					"max_turns":         a.config.MaxTurns,
+					"tool_threshold":    int(float64(a.config.MaxToolExecutions) * 0.75),
+					"turn_threshold":    int(float64(a.config.MaxTurns) * 0.75),
+					"has_tool_reminder": toolReminder != "",
+					"has_turn_reminder": turnReminder != "",
+				})
+			}
 		}
 
 		// The repeat-call note from the last tool batch rides this provider call
@@ -2670,7 +2682,6 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 		// loom's own estimate (§5.1) — a no-op under the start mark, otherwise it
 		// sheds to the release mark. On a shed, recompile messages and the
 		// advertised tool set so a fold-deactivated skill's tools do not linger.
-		contextReminder := ""
 		if segMem, ok := session.SegmentedMem.(*SegmentedMemory); ok && segMem != nil {
 			shed, estimate, target := segMem.ReleasePressure(ctx, 0)
 			if shed {
@@ -2683,13 +2694,21 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				tools = recovery.activeTools(tools)
 				segMem.SetAdvertisedToolsBytes(advertisedToolsBytes(tools))
 			}
-			// Relief left the estimate over its release mark, whether or not it
-			// shed (under the start mark it returns 0, 0 and this is false). The
-			// reminder is transient: softReminder is read at send time.
-			if estimate > target {
+			// Opt-in (behavior.context_relief_warning). Relief ran and left the
+			// estimate over its release mark, whether or not it shed; under the
+			// start mark it returns 0, 0 and this is false, so the note rides
+			// only the sends where relief ran. It is transient: softReminder is
+			// read at send time.
+			if a.config.ContextReliefWarning && estimate > target {
 				used, available, _ := segMem.GetTokenBudgetUsage()
-				contextReminder = buildContextReminder(estimate, used+available)
-				softReminder += contextReminder
+				usable := used + available
+				softReminder += buildContextReminder(estimate, target, usable)
+				span.AddEvent("context_reminder.added", map[string]interface{}{
+					"turn":            turnCount,
+					"estimate_tokens": estimate,
+					"target_tokens":   target,
+					"usable_tokens":   usable,
+				})
 			}
 			// Relief has nothing left to shed and the turn's own stubs still
 			// hold the context over the start mark: every further send is a
@@ -2722,20 +2741,6 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 						"tool_results":    o.ToolResults,
 					})
 			}
-		}
-
-		if softReminder != "" {
-			span.AddEvent("soft_reminder.added", map[string]interface{}{
-				"tool_count":           toolExecutionCount,
-				"turn_count":           turnCount,
-				"max_tools":            a.config.MaxToolExecutions,
-				"max_turns":            a.config.MaxTurns,
-				"tool_threshold":       int(float64(a.config.MaxToolExecutions) * 0.75),
-				"turn_threshold":       int(float64(a.config.MaxTurns) * 0.75),
-				"has_tool_reminder":    toolReminder != "",
-				"has_turn_reminder":    turnReminder != "",
-				"has_context_reminder": contextReminder != "",
-			})
 		}
 
 		// withReminder appends the transient tail — the turn's soft reminder —
