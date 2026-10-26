@@ -2748,11 +2748,14 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				Content: "<system-reminder>\n" + tail + "\n</system-reminder>"})
 		}
 
-		// sendChat is the one provider call of this iteration. The tool-change
-		// note is computed against the tools this call sends. The baseline moves
-		// only when the call succeeds, so a refused send is reported again by the
-		// resend instead of being swallowed.
+		// sendChat is the one provider call of this iteration. With
+		// behavior.tool_change_note on, the note is computed against the tools
+		// this call sends. The baseline moves only when the call succeeds, so a
+		// refused send is reported again by the resend instead of being swallowed.
 		sendChat := func(ts []shuttle.Tool) (*LLMResponse, error) {
+			if !a.config.ToolChangeNote {
+				return a.chatWithRetry(ctx, withReminder(messages, ""), ts)
+			}
 			names := make([]string, 0, len(ts))
 			for _, t := range ts {
 				names = append(names, t.Name())
@@ -3624,12 +3627,25 @@ func toolDeltaNote(prev, cur []string) string {
 	sort.Strings(removed)
 	var parts []string
 	if len(added) > 0 {
-		parts = append(parts, "Tools added: "+strings.Join(added, ", ")+".")
+		parts = append(parts, "Tools added: "+toolNoteList(added)+".")
 	}
 	if len(removed) > 0 {
-		parts = append(parts, "Tools removed: "+strings.Join(removed, ", ")+".")
+		parts = append(parts, "Tools removed: "+toolNoteList(removed)+".")
 	}
 	return strings.Join(parts, " ")
+}
+
+// toolNoteMaxNames bounds the names one side of the note lists, so a skill that
+// brings up an MCP server with a hundred tools cannot make the note a hundred
+// names long.
+const toolNoteMaxNames = 10
+
+// toolNoteList joins names, then counts the ones past toolNoteMaxNames.
+func toolNoteList(names []string) string {
+	if len(names) <= toolNoteMaxNames {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s, and %d more", strings.Join(names[:toolNoteMaxNames], ", "), len(names)-toolNoteMaxNames)
 }
 
 // canonicalJSON serializes a map to a deterministic JSON string for deduplication.

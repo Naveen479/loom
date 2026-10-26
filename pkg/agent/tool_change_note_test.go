@@ -16,6 +16,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
@@ -33,6 +34,22 @@ func TestToolDeltaNote(t *testing.T) {
 	assert.Equal(t, "Tools added: a, c.", toolDeltaNote([]string{"b"}, []string{"c", "b", "a"}), "add only, sorted")
 	assert.Equal(t, "Tools removed: b, c.", toolDeltaNote([]string{"a", "c", "b"}, []string{"a"}), "remove only, sorted")
 	assert.Equal(t, "Tools added: x. Tools removed: a.", toolDeltaNote([]string{"a", "b"}, []string{"b", "x"}), "both")
+}
+
+// A skill that brings up a server with many tools must not make the note as
+// long as the tool list: ten names, then a count.
+func TestToolDeltaNote_CapsLongLists(t *testing.T) {
+	var cur []string
+	for i := 0; i < 25; i++ {
+		cur = append(cur, fmt.Sprintf("t%02d", i))
+	}
+	note := toolDeltaNote(nil, cur)
+	assert.Equal(t, "Tools added: t00, t01, t02, t03, t04, t05, t06, t07, t08, t09, and 15 more.", note)
+	assert.NotContains(t, note, "t10")
+	// Exactly at the cap is listed whole.
+	assert.Equal(t, "Tools added: "+strings.Join(cur[:10], ", ")+".", toolDeltaNote(nil, cur[:10]))
+	// The removed side is capped the same way.
+	assert.Contains(t, toolDeltaNote(cur, nil), "Tools removed: t00, t01, t02, t03, t04, t05, t06, t07, t08, t09, and 15 more.")
 }
 
 // revealTool registers a session-scoped tool while the first tool of the turn
@@ -65,7 +82,7 @@ func TestAgent_ToolChangeNoteOnlyOnChangedCall(t *testing.T) {
 			{content: "done"},
 		},
 	}}
-	ag := NewAgent(&mockBackend{}, llm, WithConfig(&Config{MaxTurns: 10, MaxToolExecutions: 10, MaxIterations: 10}))
+	ag := NewAgent(&mockBackend{}, llm, WithConfig(&Config{MaxTurns: 10, MaxToolExecutions: 10, MaxIterations: 10, ToolChangeNote: true}))
 	ag.RegisterTool(&revealTool{namedStubTool: namedStubTool{name: "reveal"}, ag: ag, sessionID: sid})
 
 	_, err := ag.Chat(context.Background(), sid, "use the tool")
@@ -120,7 +137,7 @@ func (r *resendLLM) Chat(_ context.Context, messages []llmtypes.Message, _ []shu
 func TestAgent_ToolChangeNoteResendUsesSentTools(t *testing.T) {
 	const sid = "tool_change_resend"
 	llm := &resendLLM{mockToolCallingLLM: &mockToolCallingLLM{}, sid: sid}
-	ag := NewAgent(&mockBackend{}, llm, WithConfig(&Config{MaxTurns: 10, MaxToolExecutions: 10, MaxIterations: 10}))
+	ag := NewAgent(&mockBackend{}, llm, WithConfig(&Config{MaxTurns: 10, MaxToolExecutions: 10, MaxIterations: 10, ToolChangeNote: true}))
 	llm.ag = ag
 	ag.RegisterTool(&revealTool{namedStubTool: namedStubTool{name: "reveal"}, ag: ag, sessionID: sid})
 
@@ -132,6 +149,100 @@ func TestAgent_ToolChangeNoteResendUsesSentTools(t *testing.T) {
 	require.Len(t, llm.seen, 3)
 	lastOf := func(msgs []llmtypes.Message) string { return msgs[len(msgs)-1].Content }
 	assert.Contains(t, lastOf(llm.seen[1]), "Tools added: late_tool.", "the refused send carries its own note")
-	assert.Contains(t, lastOf(llm.seen[2]), "Tools added: late2, late_tool.", "the resend diffs against the last successful send")
-	assert.NotContains(t, lastOf(llm.seen[2]), "Tools added: late_tool.\n", "no stale note from the refused send")
+	assert.Contains(t, lastOf(llm.seen[2]), "<system-reminder>\nTools added: late2, late_tool.\n</system-reminder>",
+		"the resend diffs against the last successful send, so it lists both tools and nothing stale")
+}
+
+// The agent that has not opted in sees no note in the scenario that produces
+// one when the flag is on.
+func TestAgent_ToolChangeNoteOffByDefault(t *testing.T) {
+	const sid = "tool_change_off"
+	llm := &recordingToolLLM{mockToolCallingLLM: &mockToolCallingLLM{
+		responses: []mockLLMResponse{
+			{toolCalls: []llmtypes.ToolCall{{ID: "c1", Name: "reveal", Input: map[string]interface{}{}}}},
+			{toolCalls: []llmtypes.ToolCall{{ID: "c2", Name: "reveal", Input: map[string]interface{}{}}}},
+			{content: "done"},
+		},
+	}}
+	ag := NewAgent(&mockBackend{}, llm, WithConfig(&Config{MaxTurns: 10, MaxToolExecutions: 10, MaxIterations: 10}))
+	ag.RegisterTool(&revealTool{namedStubTool: namedStubTool{name: "reveal"}, ag: ag, sessionID: sid})
+
+	_, err := ag.Chat(context.Background(), sid, "use the tool")
+	require.NoError(t, err)
+
+	llm.recMu.Lock()
+	defer llm.recMu.Unlock()
+	require.Len(t, llm.seen, 3)
+	for i, msgs := range llm.seen {
+		assert.NotContains(t, msgs[len(msgs)-1].Content, "Tools added", "call %d", i)
+	}
+}
+
+// retireTool unregisters another tool while it executes, the way a server
+// dropping its tools mid-turn does.
+type retireTool struct {
+	namedStubTool
+	ag     *Agent
+	retire string
+}
+
+func (r *retireTool) Execute(context.Context, map[string]interface{}) (*shuttle.Result, error) {
+	r.ag.tools.Unregister(r.retire)
+	return &shuttle.Result{Success: true, Data: "ok"}, nil
+}
+
+// A tool that leaves the advertised set mid-turn is announced as removed on the
+// first call that no longer sends it, and only on that call.
+func TestAgent_ToolChangeNoteRemovedMidTurn(t *testing.T) {
+	const sid = "tool_change_removed"
+	llm := &recordingToolLLM{mockToolCallingLLM: &mockToolCallingLLM{
+		responses: []mockLLMResponse{
+			{toolCalls: []llmtypes.ToolCall{{ID: "c1", Name: "retire", Input: map[string]interface{}{}}}},
+			{toolCalls: []llmtypes.ToolCall{{ID: "c2", Name: "keeper", Input: map[string]interface{}{}}}},
+			{content: "done"},
+		},
+	}}
+	ag := NewAgent(&mockBackend{}, llm, WithConfig(&Config{MaxTurns: 10, MaxToolExecutions: 10, MaxIterations: 10, ToolChangeNote: true}))
+	ag.RegisterTool(&retireTool{namedStubTool: namedStubTool{name: "retire"}, ag: ag, retire: "gone"})
+	ag.RegisterTool(namedStubTool{name: "gone"})
+	ag.RegisterTool(namedStubTool{name: "keeper"})
+
+	_, err := ag.Chat(context.Background(), sid, "use the tool")
+	require.NoError(t, err)
+
+	llm.recMu.Lock()
+	defer llm.recMu.Unlock()
+	require.Len(t, llm.seen, 3)
+	lastOf := func(msgs []llmtypes.Message) string { return msgs[len(msgs)-1].Content }
+	assert.NotContains(t, lastOf(llm.seen[0]), "Tools removed", "first send of a turn compares with nothing")
+	assert.Contains(t, lastOf(llm.seen[1]), "<system-reminder>\nTools removed: gone.\n</system-reminder>")
+	assert.NotContains(t, lastOf(llm.seen[2]), "Tools removed", "no further change, no note")
+}
+
+// The YAML key is the only way to opt in, and it reaches the agent's Config
+// through the registry.
+func TestToolChangeNote_OptIn(t *testing.T) {
+	yamlFor := func(extra string) string {
+		return `
+agent:
+  name: note_agent
+  llm:
+    provider: anthropic
+    model: claude-3-5-sonnet-20241022
+  behavior:
+` + extra
+	}
+	registry, _ := createTestRegistry(t)
+	build := func(extra string) *Agent {
+		cfg, err := LoadConfigFromString(yamlFor(extra))
+		require.NoError(t, err)
+		cfg.Llm = createTestAgentConfig("x").Llm // the registry's mock provider
+		ag, err := registry.buildAgent(context.Background(), cfg)
+		require.NoError(t, err)
+		return ag
+	}
+
+	assert.True(t, build("    tool_change_note: true\n").GetConfig().ToolChangeNote)
+	assert.False(t, build("    tool_change_note: false\n").GetConfig().ToolChangeNote)
+	assert.False(t, build("    max_turns: 5\n").GetConfig().ToolChangeNote)
 }
