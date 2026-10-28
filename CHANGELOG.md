@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Opt-in hint after repeated identical tool calls.** Off by default. An agent turns it on with `behavior.repeat_call_hint: true` in its YAML. When on, the hint fires after 3, then 5, then 8 identical consecutive executed tool calls (same name and canonical input; a call rejected before execution neither counts nor resets the run) and names the count and tool in the next provider request as a transient `<system-reminder>`. The note is never written into a tool result, so offloaded, tabular and JSON rows stay exactly as the tool returned them, and it is not stored or replayed in later turns. A failed call gets no note. Thresholds are fixed at 3/5/8 (`RecoveryConfig.RepeatHintThresholds` is still settable in Go). See `docs/reference/self-correction.md`.
 - **Guidance messages load from `prompts/guidance/self_correction.yaml`.** The lookup tries `guidance.self_correction.<id>`, the namespace the file registers under; before, every YAML entry was unreachable and the hard-coded text always ran. A rendered message that still holds a placeholder falls back to the hard-coded text.
 
+#### Graph memory keyed by a stable agent ID
+- **`agent.Config.GraphMemoryAgentID` keys graph memory instead of the agent name.** Graph memory reads and writes were keyed by `Config.Name`, so renaming an agent orphaned its memories. Set `GraphMemoryAgentID` to an ID that survives renames; empty keeps the name (unchanged behaviour). The agent's own ID is not a fallback: it is a fresh UUID per instance. Rows written under an earlier name are not re-keyed; re-key them in the embedder's own data migration.
+
 ### Fixed
 
 #### Token counting: the encoding ships in the binary
