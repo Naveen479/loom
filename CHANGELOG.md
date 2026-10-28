@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### Token counting: the encoding ships in the binary
+- **The token counter no longer downloads its encoding.** `pkg/agent`'s counter fetched `cl100k_base` from `openaipublic.blob.core.windows.net` on first use; without network access (an air-gapped or locked-down server, a sandboxed CI runner) it fell back to a characters/4 estimate for the life of the process, which skews relief and budget decisions. It now loads the encoding bundled by `github.com/pkoukk/tiktoken-go-loader` (MIT; its `cl100k_base.tiktoken` has the SHA-256 that OpenAI's tiktoken verifies). The binary grows by about 7 MB.
+
 #### Agent: synthetic user-turn rows are protected from the fold and stamped again
 - **The current-turn fold and the arrival stamp only matched `Role == "user"`.** After #387 the skill-body sidecar, hygiene nudge, empty-response retry nudge and synthesis prompt persist under their own roles, so `ReleasePressure` could fold a skill body into a summary and `renderLocked` skipped their arrival stamp. Both now use `IsSyntheticWireUserRole`, restoring the pre-#387 behavior. A test pins the `pkg/agent` role constants to `internal/message`. Sessions written between #387 and this fix compile to different bytes once, which costs one prompt-cache miss; after that the bytes are stable.
 
