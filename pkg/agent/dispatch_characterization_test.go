@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/teradata-labs/loom/pkg/fabric"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
 	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/shuttle"
@@ -407,4 +408,48 @@ func TestDispatch_AdmissionDeniedMiddleCallStaysInOrder(t *testing.T) {
 	require.False(t, rows[1].ToolResult.Success)
 	require.Equal(t, "permission_denied", rows[1].ToolResult.Error.Code)
 	require.Contains(t, rows[2].Content, "ran:C")
+}
+
+// A call whose tool breaker is already open never ran, so the recovered row
+// comes from tier-1 recovery and the executed-call bookkeeping (guardrails
+// error tracking) must not fire for it.
+func TestDispatch_BreakerOpenSkipsLeaseAndGuardrails(t *testing.T) {
+	flaky := &dispatchProbeTool{name: "probe_flaky"}
+	cfg := DefaultConfig()
+	cfg.PatternConfig = DefaultPatternConfig()
+	cfg.PatternConfig.UseLLMClassifier = false
+	cfg.EnableSelfHealing = true
+	llm := &recordingToolLLM{mockToolCallingLLM: &mockToolCallingLLM{responses: []mockLLMResponse{
+		{toolCalls: []llmtypes.ToolCall{probeCall("id-A", "probe_flaky", "A")}},
+		{content: "done"},
+	}}}
+	ag := NewAgent(&mockBackend{}, llm, WithConfig(cfg))
+	ag.RegisterTool(flaky)
+
+	// Trip the tool's breaker the way production does.
+	breaker := ag.circuitBreakers.GetBreaker(ag.executor.CanonicalToolName("probe_flaky"))
+	for i := 0; i < fabric.DefaultCircuitBreakerConfig().FailureThreshold; i++ {
+		_ = breaker.Execute(func() error { return context.DeadlineExceeded })
+	}
+
+	// Seed a guardrails record: an executed failed call would bump AttemptCount.
+	seed := &fabric.ErrorAnalysisInfo{ErrorType: "seed", Summary: "seed"}
+	ag.guardrails.HandleErrorWithAnalysis(context.Background(), "dispatch-brk", "", seed)
+	require.Equal(t, 1, ag.guardrails.GetErrorRecord("dispatch-brk").AttemptCount)
+
+	resp, err := ag.Chat(context.Background(), "dispatch-brk", "go")
+	require.NoError(t, err)
+	require.Equal(t, "done", resp.Content)
+
+	require.Empty(t, flaky.executed(), "an open breaker rejects the call before the body runs")
+
+	rows := toolRows(t, ag, "dispatch-brk")
+	require.Equal(t, []string{"id-A"}, toolRowIDs(rows))
+	require.NotNil(t, rows[0].ToolResult)
+	require.False(t, rows[0].ToolResult.Success)
+	require.Equal(t, "tool_disabled", rows[0].ToolResult.Error.Code, "tier-1 recovery supplies the row")
+
+	rec := ag.guardrails.GetErrorRecord("dispatch-brk")
+	require.NotNil(t, rec, "guardrails record not cleared")
+	require.Equal(t, 1, rec.AttemptCount, "guardrails error tracking is skipped for a call that never ran")
 }
