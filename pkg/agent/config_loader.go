@@ -355,6 +355,9 @@ type BehaviorConfigYAML struct {
 	// ContextReliefWarning opts the agent into the context-relief warning
 	// (default off).
 	ContextReliefWarning bool `yaml:"context_relief_warning"`
+	// ParallelReadTools opts the agent into running consecutive
+	// concurrency-safe tool calls of one response in parallel (default off).
+	ParallelReadTools bool `yaml:"parallel_read_tools"`
 }
 
 // SkillsConfigYAML represents skills configuration in YAML
@@ -930,6 +933,14 @@ func yamlToProto(yaml *AgentConfigYAML) (*loomv1.AgentConfig, error) {
 			config.Metadata = make(map[string]string)
 		}
 		config.Metadata["_context_relief_warning"] = "true"
+	}
+
+	// Parallel dispatch of read-only tool calls is opt-in the same way.
+	if yaml.Agent.Behavior.ParallelReadTools {
+		if config.Metadata == nil {
+			config.Metadata = make(map[string]string)
+		}
+		config.Metadata["_parallel_read_tools"] = "true"
 	}
 
 	return config, nil

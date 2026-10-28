@@ -126,6 +126,13 @@ func (e *Executor) SetAdmissionChain(chain *Chain) {
 	e.admissionChain = chain
 }
 
+// HasAdmissionChain reports whether an admission hook chain is configured.
+// Admission hooks are order-dependent across the calls of one batch, so a
+// caller must not run calls concurrently while one is set.
+func (e *Executor) HasAdmissionChain() bool {
+	return e.admissionChain != nil
+}
+
 // SetApprovedSet configures the approved-set accessor threaded to admission
 // hooks as AdmissionRequest.State. A nil accessor leaves a gated-allowlist with
 // no store to read, so it fails closed.

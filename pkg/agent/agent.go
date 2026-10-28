@@ -3140,12 +3140,7 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			batchIDCount:       batchIDCount,
 		}
 
-		for i, toolCall := range llmResp.ToolCalls {
-			if toolExecutionCount >= a.config.MaxToolExecutions {
-				break
-			}
-			a.dispatchOneCall(ctx, session, toolCall, i, st)
-		}
+		a.dispatchBatch(ctx, session, llmResp.ToolCalls, st)
 
 		// Drain buffered text_body sidecars from this batch AFTER every
 		// tool_result is in place. Order within the batch preserved so a
