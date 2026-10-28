@@ -404,6 +404,21 @@ func (a *MCPToolAdapter) Backend() string {
 	return fmt.Sprintf("mcp:%s", a.serverName)
 }
 
+// ConcurrencySafe is true only when the server annotates the tool readOnlyHint
+// true and does not also mark it destructive; a nil or false hint is not
+// concurrency-safe. A hint is the server's claim, not a guarantee.
+func (a *MCPToolAdapter) ConcurrencySafe() bool {
+	if a == nil {
+		return false
+	}
+	h := a.tool.Annotations
+	if h == nil || h.ReadOnlyHint == nil || !*h.ReadOnlyHint {
+		return false
+	}
+	// readOnly + destructive is contradictory; refuse it.
+	return h.DestructiveHint == nil || !*h.DestructiveHint
+}
+
 // HasUI returns true if this tool has an associated MCP Apps UI resource.
 func (a *MCPToolAdapter) HasUI() bool {
 	return a.uiResourceURI != ""
