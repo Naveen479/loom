@@ -14,6 +14,14 @@
 
 //go:build fts5
 
+// Test layout: TestGraphMemory_RecallUsesKey is the only test that uses a spy
+// store (keySpyStore); it records the agent ID of every recall-side read. The
+// other keyed-path tests (extraction, tool, rename, multi-hop, skill eviction)
+// use the real SQLite graph store and assert on the rows actually stored or
+// returned, including that nothing is written under the agent name. The
+// WithGraphMemoryAgentID and span-attribute tests check the option and the
+// graph_memory.recall span directly.
+
 package agent
 
 import (
@@ -295,4 +303,41 @@ func TestGraphMemory_SkillEvictionUsesKey(t *testing.T) {
 		after, err := store.GetMemory(ctx, "u1", mem.ID)
 		return err == nil && after.AccessCount > before.AccessCount
 	}, 3*time.Second, 20*time.Millisecond, "eviction must touch memories keyed by the ID")
+}
+
+func TestWithGraphMemoryAgentID(t *testing.T) {
+	withID := NewAgent(nil, nil, WithName("name"), WithGraphMemoryAgentID("stable-id"))
+	assert.Equal(t, "stable-id", withID.graphMemoryKey())
+	assert.Equal(t, "name", withID.config.Name, "the option must not touch the name")
+
+	without := NewAgent(nil, nil, WithName("name"))
+	assert.Equal(t, "name", without.graphMemoryKey())
+}
+
+// The recall span records which memory partition was queried.
+func TestGraphMemory_RecallSpanCarriesKey(t *testing.T) {
+	for _, tc := range []struct{ name, id, want string }{
+		{"id set", "u1", "u1"},
+		{"falls back to name", "", "old"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &spanKeepingTracer{}
+			a := graphKeyReader(newTestGraphMemoryStore(t), "old", tc.id)
+			a.tracer = tr
+			graphKeyInject(a)
+
+			var got interface{}
+			found := false
+			tr.mu.Lock()
+			for _, sp := range tr.spans {
+				if sp.Name == "graph_memory.recall" {
+					found = true
+					got = sp.Attributes["graph_memory.agent_key"]
+				}
+			}
+			tr.mu.Unlock()
+			require.True(t, found, "no graph_memory.recall span")
+			assert.Equal(t, tc.want, got)
+		})
+	}
 }

@@ -656,6 +656,14 @@ func WithName(name string) Option {
 	}
 }
 
+// WithGraphMemoryAgentID sets the stable key for graph memory reads and writes
+// (Config.GraphMemoryAgentID), so memories survive a rename of the agent.
+func WithGraphMemoryAgentID(id string) Option {
+	return func(a *Agent) {
+		a.config.GraphMemoryAgentID = id
+	}
+}
+
 // WithSystemPrompt sets the direct system prompt text.
 func WithSystemPrompt(prompt string) Option {
 	return func(a *Agent) {
@@ -3884,6 +3892,9 @@ func (a *Agent) injectGraphMemoryContext(ctx context.Context, session *types.Ses
 	// (az512h). One span, outcome always set.
 	ctx, span := a.tracer.StartSpan(ctx, "graph_memory.recall")
 	defer a.tracer.EndSpan(span)
+	// Which memory partition this recall queries; differs from the agent name
+	// when GraphMemoryAgentID is set.
+	span.SetAttribute("graph_memory.agent_key", a.graphMemoryKey())
 	outcome := "unknown"
 	defer func() { span.SetAttribute("recall.outcome", outcome) }()
 

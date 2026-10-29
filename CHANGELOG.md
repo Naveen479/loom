@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Guidance messages load from `prompts/guidance/self_correction.yaml`.** The lookup tries `guidance.self_correction.<id>`, the namespace the file registers under; before, every YAML entry was unreachable and the hard-coded text always ran. A rendered message that still holds a placeholder falls back to the hard-coded text.
 
 #### Graph memory keyed by a stable agent ID
-- **`agent.Config.GraphMemoryAgentID` keys graph memory instead of the agent name.** Graph memory reads and writes were keyed by `Config.Name`, so renaming an agent orphaned its memories. Set `GraphMemoryAgentID` to an ID that survives renames; empty keeps the name (unchanged behaviour). The agent's own ID is not a fallback: it is a fresh UUID per instance. Rows written under an earlier name are not re-keyed; re-key them in the embedder's own data migration.
+- **`agent.Config.GraphMemoryAgentID` keys graph memory instead of the agent name.** Graph memory reads and writes were keyed by `Config.Name`, so renaming an agent orphaned its memories. Set `GraphMemoryAgentID` to an ID that survives renames; empty keeps the name (unchanged behaviour). The agent's own ID is not a fallback: it is a fresh UUID per instance. Rows written under an earlier name are not re-keyed; re-key them in the embedder's own data migration. Go-only (no YAML or proto field): set it with `agent.WithGraphMemoryAgentID(id)` or via `WithConfig`; two agents given the same ID share one graph. The `graph_memory.recall` span carries the key as `graph_memory.agent_key`.
 
 ### Fixed
 
