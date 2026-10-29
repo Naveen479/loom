@@ -946,6 +946,16 @@ func yamlToProto(yaml *AgentConfigYAML) (*loomv1.AgentConfig, error) {
 	return config, nil
 }
 
+// ApplyMetadataBehavior maps the behavior flags yamlToProto encodes in an
+// agent's metadata onto cfg. Every place that builds a Config from a
+// loomv1.AgentConfig calls it, so a YAML key cannot work in one host and be
+// ignored in another. It maps only _parallel_read_tools for now; the sibling
+// flags (_tool_change_note, _context_relief_warning, _repeat_call_hint) are
+// tracked in issue #526.
+func ApplyMetadataBehavior(cfg *Config, md map[string]string) {
+	cfg.ParallelReadTools = md["_parallel_read_tools"] == "true"
+}
+
 // parseMemoryCompressionConfig converts YAML memory compression config to proto
 func parseMemoryCompressionConfig(yaml *MemoryCompressionConfigYAML) *loomv1.MemoryCompressionConfig {
 	if yaml == nil {

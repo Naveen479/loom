@@ -25,6 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	llmtypes "github.com/teradata-labs/loom/pkg/llm/types"
+	"github.com/teradata-labs/loom/pkg/observability"
 	"github.com/teradata-labs/loom/pkg/prompts"
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
@@ -37,8 +38,6 @@ type flightTracker struct {
 
 	mu     sync.Mutex
 	events []string
-	starts []time.Time
-	ends   []time.Time
 }
 
 func (f *flightTracker) enter(label string) {
@@ -51,14 +50,12 @@ func (f *flightTracker) enter(label string) {
 	}
 	f.mu.Lock()
 	f.events = append(f.events, "start:"+label)
-	f.starts = append(f.starts, time.Now())
 	f.mu.Unlock()
 }
 
 func (f *flightTracker) leave(label string) {
 	f.mu.Lock()
 	f.events = append(f.events, "end:"+label)
-	f.ends = append(f.ends, time.Now())
 	f.mu.Unlock()
 	f.active.Add(-1)
 }
@@ -67,24 +64,6 @@ func (f *flightTracker) log() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]string(nil), f.events...)
-}
-
-// span is the wall time from the first start to the last end.
-func (f *flightTracker) span() time.Duration {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	first, last := f.starts[0], f.ends[0]
-	for _, s := range f.starts {
-		if s.Before(first) {
-			first = s
-		}
-	}
-	for _, e := range f.ends {
-		if e.After(last) {
-			last = e
-		}
-	}
-	return last.Sub(first)
 }
 
 // parallelProbe is a recording tool: it sleeps delay, reports to its tracker
@@ -96,6 +75,7 @@ type parallelProbe struct {
 	tr    *flightTracker
 	fn    func(v string) (*shuttle.Result, error)
 	runs  atomic.Int32
+	gate  *gate
 }
 
 func (p *parallelProbe) Name() string        { return p.name }
@@ -111,11 +91,53 @@ func (p *parallelProbe) Execute(_ context.Context, params map[string]interface{}
 	label := p.name + ":" + v
 	p.tr.enter(label)
 	defer p.tr.leave(label)
+	if p.gate != nil {
+		p.gate.started <- label
+		<-p.gate.release
+	}
 	time.Sleep(p.delay)
 	if p.fn != nil {
 		return p.fn(v)
 	}
 	return &shuttle.Result{Success: true, Data: "ran:" + v}, nil
+}
+
+// gate holds every execution of the probes sharing it until release is
+// closed, after signalling on started, so a test sees calls in flight together
+// without relying on timing.
+type gate struct {
+	started chan string
+	release chan struct{}
+}
+
+func newGate() *gate {
+	return &gate{started: make(chan string, 64), release: make(chan struct{})}
+}
+
+// chatHeld runs one Chat while g holds every execution, requires n executions
+// in flight at once, then releases them. A dispatch that never overlaps n calls
+// fails after the safety timeout instead of hanging.
+func chatHeld(t *testing.T, ag *Agent, sid string, g *gate, n int) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := ag.Chat(context.Background(), sid, "go")
+		done <- err
+	}()
+	got := 0
+	timeout := time.After(10 * time.Second)
+wait:
+	for got < n {
+		select {
+		case <-g.started:
+			got++
+		case <-timeout:
+			break wait
+		}
+	}
+	close(g.release)
+	require.NoError(t, <-done)
+	require.Equal(t, n, got, "calls in flight at once before release")
 }
 
 // noPrompts is a prompt registry with no entries, so a PromptAwareTool falls
@@ -160,16 +182,15 @@ func TestParallel_OffByDefault_Sequential(t *testing.T) {
 
 func TestParallel_ReadsOverlap(t *testing.T) {
 	tr := &flightTracker{}
-	plain := &parallelProbe{name: "read_a", safe: true, delay: 200 * time.Millisecond, tr: tr}
-	inner := &parallelProbe{name: "read_b", safe: true, delay: 200 * time.Millisecond, tr: tr}
+	g := newGate()
+	plain := &parallelProbe{name: "read_a", safe: true, tr: tr, gate: g}
+	inner := &parallelProbe{name: "read_b", safe: true, tr: tr, gate: g}
 	ag := parallelAgent(t, nil, batchOf(probeCall("id-1", "read_a", "1"), probeCall("id-2", "read_b", "2")))
 	ag.RegisterTool(plain)
 	ag.RegisterTool(shuttle.NewPromptAwareTool(inner, noPrompts{}, "tools.read_b"))
 
-	_, err := ag.Chat(context.Background(), "par-overlap", "go")
-	require.NoError(t, err)
+	chatHeld(t, ag, "par-overlap", g, 2)
 	assert.EqualValues(t, 2, tr.peak.Load(), "both reads, one of them prompt-wrapped, run at once")
-	assert.Less(t, tr.span(), 350*time.Millisecond, "two 200 ms reads overlap")
 	assert.Equal(t, []string{"id-1", "id-2"}, toolRowIDs(toolRows(t, ag, "par-overlap")))
 }
 
@@ -402,17 +423,146 @@ func TestParallel_PerTurnCapKeepsRowOrder(t *testing.T) {
 	}
 }
 
-func TestParallel_AdmissionChainForcesSequential(t *testing.T) {
-	tr := &flightTracker{}
-	r := &parallelProbe{name: "read", safe: true, delay: 100 * time.Millisecond, tr: tr}
+// With the default serve config (tools.permissions.yolo) the chain holds only
+// the name-level permission hook: it is order-independent, so reads still
+// overlap.
+func TestParallel_YoloPermissionChainStillParallel(t *testing.T) {
+	chain, err := shuttle.BuildChainFromConfig(shuttle.HooksConfig{},
+		shuttle.ChainDeps{Perm: shuttle.NewPermissionChecker(shuttle.PermissionConfig{YOLO: true})})
+	require.NoError(t, err)
+	g := newGate()
+	r := &parallelProbe{name: "read", safe: true, tr: &flightTracker{}, gate: g}
 	ag := parallelAgent(t, nil, batchOf(probeCall("id-1", "read", "1"), probeCall("id-2", "read", "2")),
-		WithAdmissionHooks(shuttle.NewChain(nil, nil, nil)))
+		WithAdmissionHooks(chain))
 	ag.RegisterTool(r)
 
-	_, err := ag.Chat(context.Background(), "par-admission", "go")
+	chatHeld(t, ag, "par-admission-yolo", g, 2)
+	assert.Equal(t, []string{"id-1", "id-2"}, toolRowIDs(toolRows(t, ag, "par-admission-yolo")))
+}
+
+// An order-dependent admission chain makes every call a barrier.
+func TestParallel_OrderDependentAdmissionForcesSequential(t *testing.T) {
+	yolo := shuttle.NewPermissionChecker(shuttle.PermissionConfig{YOLO: true})
+	cases := map[string]struct {
+		hooks shuttle.HooksConfig
+		perm  *shuttle.PermissionChecker
+	}{
+		// The binding scopes another tool, so the reads are admitted; its
+		// recorder post-tool hook alone makes the chain order-dependent.
+		"gated-allowlist": {hooks: shuttle.HooksConfig{Bindings: []shuttle.HookBinding{{
+			Kind: "gated-allowlist", Scope: "run_sql", StateKey: "k", SourceTool: "render_sql", StmtParam: "sql",
+		}}}, perm: yolo},
+		"ask": {hooks: shuttle.HooksConfig{Bindings: []shuttle.HookBinding{{Kind: "ask", Scope: "other_tool"}}}, perm: yolo},
+		// require_approval is the human-approval path of the permission hook.
+		"permission-requires-approval": {perm: shuttle.NewPermissionChecker(shuttle.PermissionConfig{
+			RequireApproval: true, AllowedTools: []string{"read"},
+		})},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			chain, err := shuttle.BuildChainFromConfig(tc.hooks, shuttle.ChainDeps{Perm: tc.perm})
+			require.NoError(t, err)
+			tr := &flightTracker{}
+			r := &parallelProbe{name: "read", safe: true, delay: 100 * time.Millisecond, tr: tr}
+			ag := parallelAgent(t, nil, batchOf(probeCall("id-1", "read", "1"), probeCall("id-2", "read", "2")),
+				WithAdmissionHooks(chain))
+			ag.RegisterTool(r)
+
+			_, err = ag.Chat(context.Background(), "par-admission-"+name, "go")
+			require.NoError(t, err)
+			assert.EqualValues(t, 2, r.runs.Load(), "both reads are admitted")
+			assert.EqualValues(t, 1, tr.peak.Load(), "an order-dependent chain makes every call a barrier")
+			assert.Equal(t, []string{"id-1", "id-2"}, toolRowIDs(toolRows(t, ag, "par-admission-"+name)))
+		})
+	}
+}
+
+// Each tool span records how the call was dispatched: group members carry
+// dispatch.parallel=true and the group size, a call run alone carries why.
+// With the flag off no dispatch attribute is added.
+func TestParallel_ToolSpansRecordDispatch(t *testing.T) {
+	run := func(t *testing.T, on bool) map[string]map[string]interface{} {
+		tr := &flightTracker{}
+		tracer := observability.NewMockTracer()
+		ag := parallelAgent(t, func(c *Config) { c.ParallelReadTools = on }, batchOf(
+			probeCall("id-1", "read_a", "1"), probeCall("id-2", "read_b", "2"),
+			probeCall("id-W", "write", "w"), probeCall("id-3", "read_c", "3")),
+			WithTracer(tracer))
+		for _, name := range []string{"read_a", "read_b", "read_c"} {
+			ag.RegisterTool(&parallelProbe{name: name, safe: true, tr: tr})
+		}
+		ag.RegisterTool(&parallelProbe{name: "write", safe: false, tr: tr})
+		_, err := ag.Chat(context.Background(), "par-spans", "go")
+		require.NoError(t, err)
+
+		byTool := map[string]map[string]interface{}{}
+		for _, sp := range tracer.GetSpansByName("agent.tool_execution") {
+			byTool[sp.Attributes["tool_name"].(string)] = sp.Attributes
+		}
+		require.Len(t, byTool, 4)
+		return byTool
+	}
+
+	t.Run("on", func(t *testing.T) {
+		got := run(t, true)
+		for _, name := range []string{"read_a", "read_b"} {
+			assert.Equal(t, true, got[name]["dispatch.parallel"], name)
+			assert.Equal(t, 2, got[name]["dispatch.group_size"], name)
+			assert.NotContains(t, got[name], "dispatch.barrier_reason", name)
+		}
+		assert.Equal(t, false, got["write"]["dispatch.parallel"])
+		assert.Equal(t, "not_concurrency_safe", got["write"]["dispatch.barrier_reason"])
+		assert.NotContains(t, got["write"], "dispatch.group_size")
+		assert.Equal(t, false, got["read_c"]["dispatch.parallel"])
+		assert.Equal(t, "single", got["read_c"]["dispatch.barrier_reason"])
+	})
+	t.Run("off", func(t *testing.T) {
+		for name, attrs := range run(t, false) {
+			for k := range attrs {
+				assert.NotContains(t, k, "dispatch.", "flag off adds no dispatch attribute (%s)", name)
+			}
+		}
+	})
+}
+
+// The barrier reasons the spans report for calls run alone.
+func TestParallel_BarrierReasons(t *testing.T) {
+	tr := &flightTracker{}
+	ag := parallelAgent(t, nil, nil)
+	ag.RegisterTool(&parallelProbe{name: "read", safe: true, tr: tr})
+	ag.RegisterTool(&parallelProbe{name: "write", safe: false, tr: tr})
+	ag.RegisterTool(&parallelProbe{name: "contact_human", safe: true, tr: tr})
+	st := &batchState{maxPerTurn: 10, turnDedup: map[string]*shuttle.Result{}, toolExecutionCount: new(int)}
+
+	for _, tc := range []struct {
+		calls  []ToolCall
+		n      int
+		reason string
+	}{
+		{[]ToolCall{{Name: "write"}}, 0, "not_concurrency_safe"},
+		{[]ToolCall{{Name: "contact_human"}}, 0, "contact_human"},
+		{[]ToolCall{{Name: "no_such_tool"}}, 0, "unresolved_tool"},
+		{[]ToolCall{{Name: "read"}, {Name: "write"}}, 1, "single"},
+		{[]ToolCall{{Name: "read"}, {Name: "read"}}, 1, "single"},
+		{[]ToolCall{{Name: "read", Input: map[string]interface{}{"v": "1"}}, {Name: "read", Input: map[string]interface{}{"v": "2"}}}, 2, "single"},
+	} {
+		n, reason := ag.parallelGroupLen(tc.calls, st)
+		assert.Equal(t, tc.n, n, "%v", tc.calls)
+		assert.Equal(t, tc.reason, reason, "%v", tc.calls)
+	}
+
+	st.turnDedup["read|"+canonicalJSON(nil)] = &shuttle.Result{}
+	n, reason := ag.parallelGroupLen([]ToolCall{{Name: "read"}}, st)
+	assert.Equal(t, 0, n)
+	assert.Equal(t, "duplicate_call", reason)
+
+	chain, err := shuttle.BuildChainFromConfig(shuttle.HooksConfig{Bindings: []shuttle.HookBinding{{Kind: "ask", Scope: "other_tool"}}}, shuttle.ChainDeps{})
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, tr.peak.Load(), "an admission chain makes every call a barrier")
-	assert.Equal(t, []string{"id-1", "id-2"}, toolRowIDs(toolRows(t, ag, "par-admission")))
+	gated := parallelAgent(t, nil, nil, WithAdmissionHooks(chain))
+	gated.RegisterTool(&parallelProbe{name: "read", safe: true, tr: tr})
+	n, reason = gated.parallelGroupLen([]ToolCall{{Name: "read", Input: map[string]interface{}{"v": "1"}}, {Name: "read", Input: map[string]interface{}{"v": "2"}}}, st)
+	assert.Equal(t, 0, n)
+	assert.Equal(t, "admission_order_dependent", reason)
 }
 
 func TestParallel_UnknownToolIsBarrier(t *testing.T) {
@@ -431,14 +581,20 @@ func TestParallel_UnknownToolIsBarrier(t *testing.T) {
 
 func TestParallel_FanOutCapped(t *testing.T) {
 	tr := &flightTracker{}
-	r := &parallelProbe{name: "read", safe: true, delay: 200 * time.Millisecond, tr: tr}
-	ag := parallelAgent(t, nil, batchOf(
+	g := newGate()
+	r := &parallelProbe{name: "read", safe: true, tr: tr, gate: g}
+	calls := []llmtypes.ToolCall{
 		probeCall("id-1", "read", "1"), probeCall("id-2", "read", "2"), probeCall("id-3", "read", "3"),
-		probeCall("id-4", "read", "4"), probeCall("id-5", "read", "5"), probeCall("id-6", "read", "6")))
+		probeCall("id-4", "read", "4"), probeCall("id-5", "read", "5"), probeCall("id-6", "read", "6")}
+	ag := parallelAgent(t, nil, batchOf(calls...))
 	ag.RegisterTool(r)
 
-	_, err := ag.Chat(context.Background(), "par-fanout", "go")
-	require.NoError(t, err)
+	// The group is cut at maxParallelReads; members of the next group start
+	// only after this one has settled.
+	n, _ := ag.parallelGroupLen(calls, &batchState{maxPerTurn: 10, turnDedup: map[string]*shuttle.Result{}, toolExecutionCount: new(int)})
+	require.Equal(t, maxParallelReads, n)
+
+	chatHeld(t, ag, "par-fanout", g, maxParallelReads)
 	assert.EqualValues(t, 6, r.runs.Load())
 	assert.EqualValues(t, maxParallelReads, tr.peak.Load(), "never more than maxParallelReads in flight")
 	assert.Equal(t, []string{"id-1", "id-2", "id-3", "id-4", "id-5", "id-6"}, toolRowIDs(toolRows(t, ag, "par-fanout")))

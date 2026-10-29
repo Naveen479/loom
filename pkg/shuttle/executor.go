@@ -126,11 +126,11 @@ func (e *Executor) SetAdmissionChain(chain *Chain) {
 	e.admissionChain = chain
 }
 
-// HasAdmissionChain reports whether an admission hook chain is configured.
-// Admission hooks are order-dependent across the calls of one batch, so a
-// caller must not run calls concurrently while one is set.
-func (e *Executor) HasAdmissionChain() bool {
-	return e.admissionChain != nil
+// AdmissionOrderDependent reports whether the admission chain's verdicts can
+// depend on the order of the calls of one batch (see Chain.OrderIndependent).
+// A caller must not run calls concurrently while it is true.
+func (e *Executor) AdmissionOrderDependent() bool {
+	return !e.admissionChain.OrderIndependent()
 }
 
 // SetApprovedSet configures the approved-set accessor threaded to admission

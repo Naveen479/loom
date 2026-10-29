@@ -44,6 +44,12 @@ const maxParallelReads = 4
 // A safe tool that panics is turned into an error row only inside a group; a
 // lone call still takes the sequential path, where the panic is not recovered.
 //
+// Every call dispatched here with the flag on is traced on its tool span:
+// dispatch.parallel, plus dispatch.group_size for a group member or
+// dispatch.barrier_reason for a call run alone. A member's span covers prepare
+// to settle, so it includes waiting for slower members; execution_time_ms is
+// the accurate per-call time.
+//
 // ResumeChat does not use this: its parked-batch completion stays sequential.
 func (a *Agent) dispatchBatch(ctx Context, session *Session, calls []ToolCall, st *batchState) {
 	if !a.config.ParallelReadTools {
@@ -60,11 +66,14 @@ func (a *Agent) dispatchBatch(ctx Context, session *Session, calls []ToolCall, s
 		if *st.toolExecutionCount >= a.config.MaxToolExecutions {
 			return
 		}
-		if n := a.parallelGroupLen(calls[i:], st); n > 1 {
+		n, reason := a.parallelGroupLen(calls[i:], st)
+		if n > 1 {
 			i += a.dispatchGroup(ctx, session, calls[i:i+n], i, st)
 			continue
 		}
+		st.barrierReason = reason
 		a.dispatchOneCall(ctx, session, calls[i], i, st)
+		st.barrierReason = ""
 		i++
 	}
 }
@@ -73,49 +82,64 @@ func (a *Agent) dispatchBatch(ctx Context, session *Session, calls []ToolCall, s
 // concurrent group. A call is eligible only if its tool resolves and declares
 // shuttle.ConcurrencySafe, it is not contact_human, and its dedup key is not
 // already cached this turn nor repeated earlier in the group (a duplicate must
-// wait to replay the first call's result).
+// wait to replay the first call's result). When n <= 1, reason says why
+// calls[0] runs alone (a stable span attribute value).
 //
-// An admission chain makes every call a barrier: its hooks are order-dependent
-// across one batch (a render call records an approval a later gated call
-// reads, and post-tool hooks run inside Execute), so the flag then degrades to
-// sequential dispatch.
+// An order-dependent admission chain makes every call a barrier (a render call
+// records an approval a later gated call reads, post-tool hooks run inside
+// Execute, an approval waits for a human), so the flag then degrades to
+// sequential dispatch. The default name-level permission hook alone is
+// order-independent and does not.
 //
 // The length is also capped by the remaining MaxToolExecutions and per-turn
 // budgets, so prepareCall can never commit a turn_limit_exceeded row while an
 // earlier group member is still unsettled.
-func (a *Agent) parallelGroupLen(calls []ToolCall, st *batchState) int {
-	if a.executor.HasAdmissionChain() {
-		return 0
+func (a *Agent) parallelGroupLen(calls []ToolCall, st *batchState) (n int, reason string) {
+	if a.executor.AdmissionOrderDependent() {
+		return 0, "admission_order_dependent"
 	}
 	limit := min(maxParallelReads,
 		a.config.MaxToolExecutions-*st.toolExecutionCount,
 		st.maxPerTurn-st.turnToolCount,
 		len(calls))
 	seen := make(map[string]bool, limit)
-	n := 0
 	for ; n < limit; n++ {
 		c := calls[n]
 		key := c.Name + "|" + canonicalJSON(c.Input)
-		if _, cached := st.turnDedup[key]; cached || seen[key] || !a.groupEligibleTool(c.Name) {
+		why := a.groupIneligibility(c.Name)
+		if _, cached := st.turnDedup[key]; cached || seen[key] {
+			why = "duplicate_call"
+		}
+		if why != "" {
+			if n == 0 {
+				return 0, why
+			}
 			break
 		}
 		seen[key] = true
 	}
-	return n
+	return n, "single"
 }
 
-// groupEligibleTool resolves name the way the executor does (direct registry
-// hit, else the canonical name) and reports whether the tool declares itself
-// concurrency-safe. An unresolved tool is not eligible (fail closed).
-func (a *Agent) groupEligibleTool(name string) bool {
+// groupIneligibility resolves name the way the executor does (direct registry
+// hit, else the canonical name) and returns why the tool may not join a group,
+// or "" if it declares itself concurrency-safe. An unresolved tool is not
+// eligible (fail closed).
+func (a *Agent) groupIneligibility(name string) string {
 	if name == "contact_human" {
-		return false
+		return "contact_human"
 	}
 	tool, ok := a.tools.Get(name)
 	if !ok {
 		tool, ok = a.tools.Get(a.executor.CanonicalToolName(name))
 	}
-	return ok && shuttle.IsConcurrencySafe(tool)
+	switch {
+	case !ok:
+		return "unresolved_tool"
+	case !shuttle.IsConcurrencySafe(tool):
+		return "not_concurrency_safe"
+	}
+	return ""
 }
 
 // dispatchGroup runs one group and returns how many calls it consumed.
@@ -134,6 +158,10 @@ func (a *Agent) dispatchGroup(ctx Context, session *Session, calls []ToolCall, f
 			break
 		}
 		pcs = append(pcs, pc)
+	}
+	for _, pc := range pcs {
+		pc.toolSpan.SetAttribute("dispatch.parallel", true)
+		pc.toolSpan.SetAttribute("dispatch.group_size", len(pcs))
 	}
 
 	results := make([]*shuttle.Result, len(pcs))

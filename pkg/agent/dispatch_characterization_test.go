@@ -266,7 +266,9 @@ func TestDispatch_CapStopsBatchAtMaxToolExecutions(t *testing.T) {
 	require.Len(t, resp.ToolExecutions, 2)
 
 	rows := toolRows(t, ag, "dispatch-cap")
-	// today's behaviour, not endorsed: tool_use ids past the cap have no tool_result; change deliberately in the dispatch refactor
+	// Pinned deliberately: tool_use ids past the cap get no tool_result row.
+	// The prepare/run/settle dispatch refactor left this unchanged; changing it
+	// is a separate decision.
 	require.Equal(t, []string{"id-1", "id-2"}, toolRowIDs(rows), "calls past the cap get no row at all")
 }
 

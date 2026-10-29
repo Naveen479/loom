@@ -3191,6 +3191,11 @@ type batchState struct {
 	parkableTail bool
 	batchIDCount map[string]int
 	awaitHeld    []heldAwait
+
+	// barrierReason is set by dispatchBatch (flag on) for a call it dispatches
+	// alone; prepareCall records it on that call's tool span. Empty adds no
+	// dispatch attributes.
+	barrierReason string
 }
 
 // dispatchOneCall runs one call of a tool batch through the full per-call
@@ -3323,6 +3328,10 @@ func (a *Agent) prepareCall(ctx Context, session *Session, toolCall ToolCall, i 
 	// Execute tool with tracing — always created
 	_, toolSpan := ctx.Tracer().StartSpan(ctx, "agent.tool_execution")
 	toolSpan.SetAttribute("tool_name", toolCall.Name)
+	if st.barrierReason != "" {
+		toolSpan.SetAttribute("dispatch.parallel", false)
+		toolSpan.SetAttribute("dispatch.barrier_reason", st.barrierReason)
+	}
 
 	return &preparedCall{call: toolCall, index: i, dedupKey: dedupKey, toolSpan: toolSpan}, false
 }
