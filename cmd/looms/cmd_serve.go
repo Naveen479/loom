@@ -3939,6 +3939,7 @@ func initializeMCPManager(config *Config, logger *zap.Logger) (*mcpManager, erro
 			Headers:          expandMCPHeaders(serverConfig.Headers),
 			EnableSessions:   serverConfig.EnableSessions,
 			EnableResumption: serverConfig.EnableResumption,
+			TrustAnnotations: serverConfig.TrustAnnotations,
 			Enabled:          enabled,
 			ToolFilter: manager.ToolFilter{
 				All: true, // Register all tools from this server

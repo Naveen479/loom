@@ -22,12 +22,16 @@ import (
 	"github.com/teradata-labs/loom/pkg/shuttle"
 )
 
+// adapterWithAnnotations builds an adapter for a TRUSTED server; the trust
+// gate itself is covered by TestMCPAdapter_UntrustedByDefault.
 func adapterWithAnnotations(a *protocol.ToolAnnotations) shuttle.Tool {
-	return NewMCPToolAdapter(nil, protocol.Tool{
+	ad := NewMCPToolAdapter(nil, protocol.Tool{
 		Name:        "t",
 		InputSchema: map[string]interface{}{"type": "object"},
 		Annotations: a,
 	}, "srv")
+	ad.SetTrustAnnotations(true)
+	return ad
 }
 
 func TestMCPAdapter_ReadOnlyHintTrue(t *testing.T) {
@@ -54,4 +58,21 @@ func TestMCPAdapter_TypedNilIsFalse(t *testing.T) {
 func TestMCPAdapter_ReadOnlyFalseIsFalse(t *testing.T) {
 	no := false
 	assert.False(t, shuttle.IsConcurrencySafe(adapterWithAnnotations(&protocol.ToolAnnotations{ReadOnlyHint: &no})))
+}
+
+// The same read-only annotated tool is concurrency-safe only once its server
+// is trusted; an untrusted server's annotations are never believed.
+func TestMCPAdapter_UntrustedByDefault(t *testing.T) {
+	yes := true
+	tool := protocol.Tool{
+		Name:        "t",
+		InputSchema: map[string]interface{}{"type": "object"},
+		Annotations: &protocol.ToolAnnotations{ReadOnlyHint: &yes},
+	}
+	a := NewMCPToolAdapter(nil, tool, "srv")
+	assert.False(t, shuttle.IsConcurrencySafe(a), "trust unset")
+	a.SetTrustAnnotations(true)
+	assert.True(t, shuttle.IsConcurrencySafe(a), "trust_annotations true")
+	a.SetTrustAnnotations(false)
+	assert.False(t, shuttle.IsConcurrencySafe(a), "trust withdrawn")
 }

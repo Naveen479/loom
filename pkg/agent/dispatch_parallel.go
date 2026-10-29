@@ -107,8 +107,10 @@ func (a *Agent) parallelGroupLen(calls []ToolCall, st *batchState) (n int, reaso
 		c := calls[n]
 		key := c.Name + "|" + canonicalJSON(c.Input)
 		why := a.groupIneligibility(c.Name)
-		if _, cached := st.turnDedup[key]; cached || seen[key] {
-			why = "duplicate_call"
+		// A repeat stops the group. At the head it replays from the turn
+		// cache without opening a tool span, so this reason is never recorded.
+		if _, cached := st.turnDedup[key]; why == "" && (cached || seen[key]) {
+			why = "single"
 		}
 		if why != "" {
 			if n == 0 {

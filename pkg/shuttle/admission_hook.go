@@ -134,7 +134,7 @@ func (h permHook) Matches(req AdmissionRequest) bool {
 // default action today, but it is the human-approval path, so the chain treats
 // it as order-dependent.
 func (h permHook) mayRequireApproval() bool {
-	return h.pc != nil && !h.pc.yolo && h.pc.requireApproval
+	return h.pc.mayRequireApproval()
 }
 
 // Evaluate runs the name-level permission check. A nil checker or a nil error

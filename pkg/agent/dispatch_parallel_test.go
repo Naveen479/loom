@@ -552,9 +552,12 @@ func TestParallel_BarrierReasons(t *testing.T) {
 	}
 
 	st.turnDedup["read|"+canonicalJSON(nil)] = &shuttle.Result{}
+	// A call already cached this turn never joins a group. It replays without
+	// opening a tool span, so no span reason names it (see
+	// TestParallel_ReplayLeavesNoDispatchAttributes).
 	n, reason := ag.parallelGroupLen([]ToolCall{{Name: "read"}}, st)
 	assert.Equal(t, 0, n)
-	assert.Equal(t, "duplicate_call", reason)
+	assert.Equal(t, "single", reason)
 
 	chain, err := shuttle.BuildChainFromConfig(shuttle.HooksConfig{Bindings: []shuttle.HookBinding{{Kind: "ask", Scope: "other_tool"}}}, shuttle.ChainDeps{})
 	require.NoError(t, err)
@@ -633,4 +636,65 @@ agent:
 	assert.False(t, on.ContextReliefWarning)
 	other := build("    tool_change_note: true\n").GetConfig()
 	assert.False(t, other.ParallelReadTools)
+}
+
+// The documented barrier reasons are exactly the ones a span can carry. A
+// deduplicated replay returns before its tool span opens, so it has no
+// dispatch attributes and no reason of its own; the write keeps its reason.
+func TestParallel_ReplayLeavesNoDispatchAttributes(t *testing.T) {
+	tr := &flightTracker{}
+	tracer := observability.NewMockTracer()
+	ag := parallelAgent(t, nil, batchOf(
+		probeCall("id-1", "read", "1"), probeCall("id-W", "write", "w"), probeCall("id-2", "read", "1")),
+		WithTracer(tracer))
+	read := &parallelProbe{name: "read", safe: true, tr: tr}
+	ag.RegisterTool(read)
+	ag.RegisterTool(&parallelProbe{name: "write", safe: false, tr: tr})
+
+	_, err := ag.Chat(context.Background(), "par-replay", "go")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"id-1", "id-W", "id-2"}, toolRowIDs(toolRows(t, ag, "par-replay")), "the replay still commits its row")
+	assert.EqualValues(t, 1, read.runs.Load(), "the repeated read replayed from the turn cache")
+
+	var reasons []interface{}
+	spans := tracer.GetSpansByName("agent.tool_execution")
+	for _, sp := range spans {
+		reasons = append(reasons, sp.Attributes["dispatch.barrier_reason"])
+	}
+	require.Len(t, spans, 2, "the replay opens no tool span")
+	assert.Equal(t, []interface{}{"single", "not_concurrency_safe"}, reasons)
+}
+
+// An embedder that sets only a require_approval checker (no admission chain)
+// still gets sequential dispatch; the same checker under yolo stays parallel.
+func TestParallel_CheckerWithoutChain(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		yolo     bool
+		wantN    int
+		wantWhy  string
+		wantPeak int32
+	}{
+		{"require_approval", false, 0, "admission_order_dependent", 1},
+		{"yolo", true, 2, "single", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checker := shuttle.NewPermissionChecker(shuttle.PermissionConfig{RequireApproval: true, YOLO: tc.yolo, AllowedTools: []string{"read"}})
+			tr := &flightTracker{}
+			r := &parallelProbe{name: "read", safe: true, delay: 100 * time.Millisecond, tr: tr}
+			ag := parallelAgent(t, nil, batchOf(probeCall("id-1", "read", "1"), probeCall("id-2", "read", "2")),
+				WithPermissionChecker(checker))
+			ag.RegisterTool(r)
+
+			calls := []ToolCall{{Name: "read", Input: map[string]interface{}{"v": "1"}}, {Name: "read", Input: map[string]interface{}{"v": "2"}}}
+			n, why := ag.parallelGroupLen(calls, &batchState{maxPerTurn: 10, turnDedup: map[string]*shuttle.Result{}, toolExecutionCount: new(int)})
+			assert.Equal(t, tc.wantN, n)
+			assert.Equal(t, tc.wantWhy, why)
+
+			_, err := ag.Chat(context.Background(), "par-checker-"+tc.name, "go")
+			require.NoError(t, err)
+			assert.EqualValues(t, 2, r.runs.Load(), "both reads are admitted")
+			assert.Equal(t, tc.wantPeak, tr.peak.Load())
+		})
+	}
 }

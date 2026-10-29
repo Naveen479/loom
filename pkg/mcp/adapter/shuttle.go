@@ -93,6 +93,12 @@ type MCPToolAdapter struct {
 	uiResourceURI string      // From tool._meta.ui.resourceUri (MCP Apps)
 	logger        *zap.Logger // Structured logger (defaults to no-op)
 
+	// trustAnnotations records that the operator opted this tool's server in
+	// to having its readOnlyHint/destructiveHint annotations believed. False
+	// (the default) keeps ConcurrencySafe false: the MCP spec treats
+	// annotations as untrusted unless the server is trusted.
+	trustAnnotations bool
+
 	// paramNameMap maps the LLM-visible property name (snake_case, as
 	// presented by InputSchema) back to the server's ORIGINAL property name
 	// from the tool's own schema. Execute renames via this map only — a key
@@ -434,11 +440,18 @@ func (a *MCPToolAdapter) Backend() string {
 	return fmt.Sprintf("mcp:%s", a.serverName)
 }
 
-// ConcurrencySafe is true only when the server annotates the tool readOnlyHint
-// true and does not also mark it destructive; a nil or false hint is not
-// concurrency-safe. A hint is the server's claim, not a guarantee.
+// SetTrustAnnotations opts this tool's server in to having its annotations
+// believed (server config `trust_annotations: true`). Default false.
+func (a *MCPToolAdapter) SetTrustAnnotations(trust bool) {
+	a.trustAnnotations = trust
+}
+
+// ConcurrencySafe is true only when the server is trusted (SetTrustAnnotations),
+// annotates the tool readOnlyHint true and does not also mark it destructive;
+// an untrusted server, or a nil or false hint, is not concurrency-safe. A hint
+// is the server's claim, not a guarantee.
 func (a *MCPToolAdapter) ConcurrencySafe() bool {
-	if a == nil {
+	if a == nil || !a.trustAnnotations {
 		return false
 	}
 	h := a.tool.Annotations
