@@ -72,6 +72,25 @@ func (e *ExecutionGap) Error() string {
 		e.SessionID, e.StepIndex, e.BatchPosition, e.ToolName, e.ToolUseID)
 }
 
+// UnknownOutcomePolicy says what ResumeSession does with a call whose intent
+// was recorded but whose result was not.
+type UnknownOutcomePolicy string
+
+const (
+	// UnknownOutcomeStop (the default) returns an ExecutionGap for an operator
+	// to resolve with ResolveExecutionGap.
+	UnknownOutcomeStop UnknownOutcomePolicy = "stop"
+	// UnknownOutcomeFail records the call as failed with "outcome unknown", and
+	// the turn goes on so the model can decide. The call is not re-run, and the
+	// result does not claim that it did or did not take effect.
+	UnknownOutcomeFail UnknownOutcomePolicy = "fail"
+)
+
+// Valid reports whether p is empty (the default) or a known policy.
+func (p UnknownOutcomePolicy) Valid() bool {
+	return p == "" || p == UnknownOutcomeStop || p == UnknownOutcomeFail
+}
+
 // ResumeSession completes a turn interrupted by a crash.
 //
 // When the session ends in an unanswered user message (the crash came before
@@ -235,6 +254,16 @@ func (a *Agent) ResumeSession(ctx context.Context, sessionID string) (_ *Respons
 			}
 
 		default:
+			if a.unknownOutcome == UnknownOutcomeFail {
+				persisted, err := a.failUnknownOutcome(ctx, agentCtx, sess, step, eventPos, call)
+				if err != nil {
+					return nil, err
+				}
+				if !persisted {
+					st.rowNotPersisted = true
+				}
+				continue
+			}
 			// Intent with no result: outcome unknown. The gap is named by
 			// FindExecutionGap, the same function ResolveExecutionGap
 			// uses, so the gap resume reports is the gap resolve-gap resolves.
@@ -588,6 +617,29 @@ func (a *Agent) backfillFromResultEvent(ctx Context, sess *Session, call ToolCal
 		Timestamp:  time.Now(),
 	}, false)
 	return persisted, nil
+}
+
+// failUnknownOutcome closes a call whose outcome is unknown, under
+// UnknownOutcomeFail: it records a failed result (so a second resume sees a
+// known result and does not decide again) and backfills the tool row from it.
+// The call is never re-run.
+func (a *Agent) failUnknownOutcome(ctx context.Context, agentCtx Context, sess *Session, step, position int, call ToolCall) (persisted bool, err error) {
+	const msg = "outcome unknown: this call was started before a crash and no result was recorded; do not assume it ran, and do not assume it did not"
+	payload, err := json.Marshal(map[string]interface{}{
+		"result": shuttle.Result{
+			Success:  false,
+			Error:    &shuttle.Error{Code: "outcome_unknown", Message: msg},
+			Metadata: map[string]interface{}{"outcome_unknown": true},
+		},
+		"error": msg,
+	})
+	if err != nil {
+		return false, fmt.Errorf("building the unknown-outcome result for call %s: %w", call.ID, err)
+	}
+	if err := a.eventLog.RecordResult(ctx, sess.ID, step, position, eventlog.EventToolCallResult, call.ID, payload); err != nil {
+		return false, fmt.Errorf("recording the unknown-outcome result for call %s: %w", call.ID, err)
+	}
+	return a.backfillFromResultEvent(agentCtx, sess, call, eventlog.ExecutionEvent{Payload: payload})
 }
 
 // ErrNoExecutionGap is returned by ResolveExecutionGap when the session has

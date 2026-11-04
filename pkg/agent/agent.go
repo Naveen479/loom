@@ -770,6 +770,16 @@ func WithEventLog(store eventlog.EventLogStore) Option {
 	}
 }
 
+// WithUnknownOutcomePolicy sets what ResumeSession does with a call whose
+// outcome is unknown (intent recorded, no result). The default stops with an
+// ExecutionGap for an operator to resolve; UnknownOutcomeFail lets the turn go
+// on with a failed result that says the outcome is unknown.
+func WithUnknownOutcomePolicy(p UnknownOutcomePolicy) Option {
+	return func(a *Agent) {
+		a.unknownOutcome = p
+	}
+}
+
 // captureBaseTools records the always-advertised tool set — every tool present
 // before any event-driven (session-scoped) registration. Idempotent: the first
 // call wins, so it must run before the first skill-required or progressive-
