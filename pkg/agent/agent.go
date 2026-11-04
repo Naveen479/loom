@@ -2867,7 +2867,9 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 			}
 			llmResp, err = sendChat(tools)
 			if err == nil {
-				a.recordLLMResult(ctx, session.ID, thisStep, llmResp)
+				if recErr := a.recordLLMResult(ctx, session.ID, thisStep, llmResp); recErr != nil {
+					return nil, recErr
+				}
 			}
 		}
 		if err != nil && errors.Is(err, llm.ErrContextTooLong) {
@@ -2893,7 +2895,9 @@ func (a *Agent) runConversationLoop(ctx Context) (*Response, error) {
 				// the result.
 				llmResp, err = sendChat(tools)
 				if err == nil {
-					a.recordLLMResult(ctx, session.ID, thisStep, llmResp)
+					if recErr := a.recordLLMResult(ctx, session.ID, thisStep, llmResp); recErr != nil {
+						return nil, recErr
+					}
 				}
 				if err != nil && errors.Is(err, llm.ErrContextTooLong) {
 					zap.L().Error("context too long after relief: turn ends",
