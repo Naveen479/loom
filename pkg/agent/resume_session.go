@@ -158,6 +158,13 @@ func (a *Agent) ResumeSession(ctx context.Context, sessionID string) (_ *Respons
 	}()
 	agentCtx := &agentContext{Context: ctx, session: sess, tracer: a.tracer, progressCallback: nil}
 
+	// A recorded model response whose assistant message never saved, and none of
+	// whose tool calls were started, is replayed from the log rather than asked
+	// for again: a second call costs again and can choose different tool calls.
+	if a.replayRecordedBatch(ctx, sess, sessionID, events) {
+		span.AddEvent("resume_session.replayed_llm_response", nil)
+	}
+
 	// A batch whose tools ran but whose assistant message never saved leaves
 	// the session looking like an earlier batch just finished. Whatever the
 	// tail looks like, resuming from it would ask the LLM again and could run
@@ -440,6 +447,87 @@ const queryToolResultName = "query_tool_result"
 // responses apart.
 func sameToolCall(a, b ToolCall) bool {
 	return a.ID == b.ID && a.Name == b.Name && canonicalJSON(a.Input) == canonicalJSON(b.Input)
+}
+
+// replayRecordedBatch rebuilds the assistant message of the newest recorded LLM
+// response from its llm_call_result event, so the resume carries on with that
+// response's tool calls instead of calling the model again. It appends the
+// message to sess and reports whether it did. It replays only when all of these
+// hold, and otherwise leaves everything to the existing paths (a fresh call, or
+// the refusals):
+//   - the response has tool calls and its payload decodes;
+//   - no saved assistant message, in the session or folded, already holds that
+//     batch;
+//   - none of the batch's calls has an intent, so nothing ran (a batch with
+//     intents is the unsaved-batch case, which stays a refusal);
+//   - the session ends in the turn's user message, or in a finished tool batch
+//     that awaits the next response, so the message goes where it belongs.
+func (a *Agent) replayRecordedBatch(ctx context.Context, sess *Session, sessionID string, events []eventlog.ExecutionEvent) bool {
+	var recorded *eventlog.ExecutionEvent
+	for i := range events {
+		e := &events[i]
+		if e.EventType == eventlog.EventLLMCallResult && (recorded == nil || e.StepIndex >= recorded.StepIndex) {
+			recorded = e
+		}
+	}
+	if recorded == nil {
+		return false
+	}
+	var resp LLMResponse
+	if err := json.Unmarshal(recorded.Payload, &resp); err != nil || len(resp.ToolCalls) == 0 {
+		return false
+	}
+	for _, e := range events {
+		if e.EventType == eventlog.EventToolCallIntent && e.StepIndex == recorded.StepIndex && !isQueryToolResultIntent(e) {
+			return false
+		}
+	}
+	msgs := rawSessionMessages(sess)
+	if len(msgs) == 0 || !(unansweredTurnTail(msgs) || msgs[len(msgs)-1].Role == "tool") {
+		return false
+	}
+	saved := func(list []Message) bool {
+		for _, m := range list {
+			if m.Role == "assistant" && len(m.ToolCalls) > 0 {
+				if _, match := matchRecordedCalls(resp.ToolCalls, m.ToolCalls); match {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	if saved(msgs) {
+		return false
+	}
+	if a.memory != nil && a.memory.store != nil {
+		rows, err := a.memory.store.ListMessagesBySeqRange(ctx, sessionID, 1, math.MaxInt64)
+		if err != nil {
+			zap.L().Warn("failed to read folded messages; not replaying the recorded response",
+				zap.String("session_id", sessionID), zap.Error(err))
+			return false
+		}
+		var folded []Message
+		for _, m := range rows {
+			if m.Folded {
+				folded = append(folded, m)
+			}
+		}
+		if saved(folded) {
+			return false
+		}
+	}
+	a.appendMessage(ctx, sess, Message{
+		Role:           "assistant",
+		Content:        resp.Content,
+		ToolCalls:      resp.ToolCalls,
+		Thinking:       resp.Thinking,
+		ThinkingBlocks: resp.ThinkingBlocks,
+		AgentID:        a.GetID(),
+		TokenCount:     resp.Usage.TotalTokens,
+		CostUSD:        resp.Usage.CostUSD,
+		Timestamp:      time.Now(),
+	}, false)
+	return true
 }
 
 // unansweredTurnTail reports whether msgs ends in a user message that opened
